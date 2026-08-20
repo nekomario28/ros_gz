@@ -224,11 +224,16 @@ bool GazeboProxy::AssertUpdatedWorldStats(simulation_interfaces::msg::Result & r
   return true;
 }
 
+void GazeboProxy::ArmResetDetection()
+{
+  std::lock_guard<std::mutex> lk(this->reset_detected_mutex_);
+  this->reset_detected_ = false;
+}
+
 bool GazeboProxy::WaitForResetDetected()
 {
   std::unique_lock lk(this->reset_detected_mutex_);
-  this->reset_detected_ = false;
-  if(!this->reset_detected_cv_.wait_for(
+  if (!this->reset_detected_cv_.wait_for(
     lk, std::chrono::milliseconds(kGzServiceTimeoutMs), [this] {return this->reset_detected_;}))
   {
     return false;

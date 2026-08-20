@@ -18,7 +18,6 @@
 #include <gz/msgs/world_control.pb.h>
 
 #include <chrono>
-#include <future>
 #include <memory>
 
 #include "../gazebo_proxy.hpp"
@@ -104,10 +103,7 @@ SetSimulationState::SetSimulationState(
           return;
         }
 
-        auto reset_detected_future = std::async(std::launch::async, [this]
-        {
-          return this->gz_proxy_->WaitForResetDetected();
-        });
+        this->gz_proxy_->ArmResetDetection();
         gz::msgs::WorldControl reset_request;
         reset_request.set_pause(true);
         reset_request.mutable_reset()->set_all(true);
@@ -123,7 +119,7 @@ SetSimulationState::SetSimulationState(
           response->result.error_message = "Unknown error while trying to reset simulation";
           return;
         }
-        if (!reset_detected_future.get()) {
+        if (!this->gz_proxy_->WaitForResetDetected()) {
           response->result.result = Result::RESULT_OPERATION_FAILED;
           response->result.error_message = "Timed out while trying to reset simulation";
           return;
