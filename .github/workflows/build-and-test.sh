@@ -38,13 +38,58 @@ rosdep init
 rosdep update --rosdistro $ROS_DISTRO
 rosdep install --from-paths ./ -i -y --rosdistro $ROS_DISTRO $ROSDEP_ARGS
 
-# Build.
+# Build. Capture output so the first concrete failure can be surfaced outside
+# the Actions log on the fork-only diagnostic PR.
 source /opt/ros/$ROS_DISTRO/setup.bash
 mkdir -p $COLCON_WS_SRC
 cp -r $GITHUB_WORKSPACE $COLCON_WS_SRC
 cd $COLCON_WS
-colcon build --event-handlers console_direct+
+set +e
+printf '\n::group::colcon build\n'
+colcon build --event-handlers console_direct+ 2>&1 | tee /tmp/ros_gz-colcon-build.log
+build_status=${PIPESTATUS[0]}
+printf '::endgroup::\n'
+if [ $build_status -ne 0 ]; then
+  first_failure=$(grep -m1 -E 'fatal error:|(^|[[:space:]])error:|CMake Error|FAILED:|Failed[[:space:]]+<<<|ninja: (error|build stopped)|make(\[[0-9]+\])?: \*\*\*' /tmp/ros_gz-colcon-build.log || true)
+  if [ -z "$first_failure" ]; then
+    first_failure=$(tail -n 1 /tmp/ros_gz-colcon-build.log)
+  fi
+  {
+    printf '### ros_gz CI diagnostic: build failure\n\n'
+    printf 'Exit status: `%s`\n\n' "$build_status"
+    printf 'First matched failure:\n\n```text\n%s\n```\n\n' "$first_failure"
+    printf 'Last 80 build-output lines:\n\n```text\n'
+    tail -n 80 /tmp/ros_gz-colcon-build.log
+    printf '\n```\n'
+  } > /tmp/ros_gz-ci-diagnostic.md
+  echo "::error title=ros_gz build failure::${first_failure//$'\n'/' '}"
+  exit $build_status
+fi
 
-# Tests.
-colcon test --event-handlers console_direct+
-colcon test-result
+# Tests. `colcon test` and `colcon test-result` are tracked separately so a
+# failing test is distinguishable from a test runner failure.
+printf '\n::group::colcon test\n'
+colcon test --event-handlers console_direct+ 2>&1 | tee /tmp/ros_gz-colcon-test.log
+test_status=${PIPESTATUS[0]}
+printf '::endgroup::\n'
+printf '\n::group::colcon test-result --verbose\n'
+colcon test-result --verbose 2>&1 | tee /tmp/ros_gz-test-result.log
+test_result_status=${PIPESTATUS[0]}
+printf '::endgroup::\n'
+
+if [ $test_status -ne 0 ] || [ $test_result_status -ne 0 ]; then
+  first_failure=$(grep -m1 -E '(^|[[:space:]])(ERROR|FAILED|Failure|Errors|error:)|Failed[[:space:]]+<<<' /tmp/ros_gz-test-result.log /tmp/ros_gz-colcon-test.log || true)
+  if [ -z "$first_failure" ]; then
+    first_failure=$(tail -n 1 /tmp/ros_gz-test-result.log)
+  fi
+  {
+    printf '### ros_gz CI diagnostic: test failure\n\n'
+    printf 'colcon test: `%s`; test-result: `%s`\n\n' "$test_status" "$test_result_status"
+    printf 'First matched failure:\n\n```text\n%s\n```\n\n' "$first_failure"
+    printf 'Verbose test-result output:\n\n```text\n'
+    tail -n 120 /tmp/ros_gz-test-result.log
+    printf '\n```\n'
+  } > /tmp/ros_gz-ci-diagnostic.md
+  echo "::error title=ros_gz test failure::${first_failure//$'\n'/' '}"
+  exit 1
+fi
