@@ -18,6 +18,7 @@
 #include <gz/msgs/world_control.pb.h>
 
 #include <chrono>
+#include <future>
 #include <memory>
 
 #include "../gazebo_proxy.hpp"
@@ -49,9 +50,17 @@ SetSimulationState::SetSimulationState(
       using Result = simulation_interfaces::msg::Result;
       using SimulationState = simulation_interfaces::msg::SimulationState;
 
+      std::future<bool> reset_detected_future;
       gz::msgs::WorldControl gz_request;
       switch (request->state.state) {
         case SimulationState::STATE_STOPPED:
+          // A stopped simulation is a paused simulation after a full reset. The state topic is not
+          // guaranteed to publish another update after the reset while paused, so use the same
+          // reset-completion signal as ResetSimulation instead of waiting on an ECM state update.
+          reset_detected_future = std::async(std::launch::async, [this]
+            {
+              return this->gz_proxy_->WaitForResetDetected();
+            });
           gz_request.set_pause(true);
           gz_request.mutable_reset()->set_all(true);
           break;
@@ -75,11 +84,40 @@ SetSimulationState::SetSimulationState(
       if (!executed) {
         response->result.result = Result::RESULT_OPERATION_FAILED;
         response->result.error_message = "Timed out while trying to set simulation state";
-      } else if (result && reply.data()) {
-        response->result.result = Result::RESULT_OK;
-      } else {
+        return;
+      }
+      if (!result || !reply.data()) {
         response->result.result = Result::RESULT_OPERATION_FAILED;
-        response->result.error_message = "Unknown error while trying to reset simulation";
+        response->result.error_message = "Unknown error while trying to set simulation state";
+        return;
+      }
+      response->result.result = Result::RESULT_OK;
+
+      // STATE_STOPPED includes a full reset. Gazebo's SceneBroadcaster publishes scene/info when
+      // that reset occurs, including when the simulation is paused and no further state update is
+      // emitted. Wait for that signal first, then ensure the pause part of the request is visible in
+      // world statistics.
+      if (request->state.state == SimulationState::STATE_STOPPED) {
+        if (!reset_detected_future.get()) {
+          response->result.result = Result::RESULT_OPERATION_FAILED;
+          response->result.error_message = "Timed out while trying to reset simulation";
+          return;
+        }
+
+        bool state_reached = this->gz_proxy_->Paused();
+        auto t_init = std::chrono::steady_clock::now();
+        auto timeout = std::chrono::milliseconds(GazeboProxy::kGzStateUpdatedTimeoutMs);
+        while (!state_reached && (std::chrono::steady_clock::now() - t_init) < timeout) {
+          if (!this->gz_proxy_->AssertUpdatedWorldStats(response->result)) {
+            return;
+          }
+          state_reached = this->gz_proxy_->Paused();
+        }
+        if (!state_reached) {
+          response->result.result = Result::RESULT_OPERATION_FAILED;
+          response->result.error_message = "Timed out while trying to stop simulation";
+        }
+        return;
       }
 
       // Since the "control" service is asynchronous, getting results from the service doesn't mean
@@ -89,13 +127,10 @@ SetSimulationState::SetSimulationState(
       auto t_init = std::chrono::steady_clock::now();
       auto timeout = std::chrono::milliseconds(GazeboProxy::kGzStateUpdatedTimeoutMs);
       while (!state_reached && (std::chrono::steady_clock::now() - t_init) < timeout) {
-        this->gz_proxy_->AssertUpdatedState(response->result);
+        if (!this->gz_proxy_->AssertUpdatedState(response->result)) {
+          return;
+        }
         switch (request->state.state) {
-          case SimulationState::STATE_STOPPED:
-            if (this->gz_proxy_->Paused() && (this->gz_proxy_->Iterations() == 0)) {
-              state_reached = true;
-            }
-            break;
           case SimulationState::STATE_PAUSED:
             if (this->gz_proxy_->Paused()) {
               state_reached = true;
@@ -110,7 +145,7 @@ SetSimulationState::SetSimulationState(
       }
       if (!state_reached) {
         response->result.result = Result::RESULT_OPERATION_FAILED;
-        response->result.error_message = "Timed out while trying to reset simulation";
+        response->result.error_message = "Timed out while trying to set simulation state";
       }
     });
 
