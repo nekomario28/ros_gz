@@ -1,9 +1,9 @@
 name: Issue 919 fixed runtime gate
 
 on:
-  push:
+  pull_request:
     branches:
-      - repro/919-before-fix
+      - ros2
 
 permissions:
   contents: read
