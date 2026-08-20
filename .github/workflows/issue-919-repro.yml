@@ -1,0 +1,98 @@
+name: Issue 919 fixed runtime gate
+
+on:
+  push:
+    branches:
+      - repro/919-before-fix
+
+permissions:
+  contents: read
+
+jobs:
+  runtime-gate:
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:noble
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build and test source against Jazzy
+        run: .github/workflows/build-and-test.sh
+        env:
+          ROS_DISTRO: jazzy
+
+      - name: Verify PLAYING to STOPPED on gzserver
+        shell: bash
+        run: |
+          set -euo pipefail
+          source /opt/ros/jazzy/setup.bash
+          source ~/ws/install/setup.bash
+
+          world_file="$(find /opt/ros/jazzy -type f -path '*/worlds/shapes.sdf' -print -quit)"
+          test -n "$world_file"
+          echo "Using world: $world_file"
+
+          ros2 run ros_gz_sim gzserver --ros-args -p world_sdf_file:="$world_file" > /tmp/issue919-gzserver.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; cat /tmp/issue919-gzserver.log || true' EXIT
+
+          for _ in $(seq 1 60); do
+            if ros2 service type /gzserver/set_simulation_state >/dev/null 2>&1 && \
+               ros2 service type /gzserver/get_simulation_state >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          ros2 service type /gzserver/set_simulation_state
+          ros2 service type /gzserver/get_simulation_state
+
+          python3 - <<'PY'
+          import rclpy
+          from simulation_interfaces.msg import Result, SimulationState
+          from simulation_interfaces.srv import GetSimulationState, SetSimulationState
+
+          rclpy.init()
+          node = rclpy.create_node('issue_919_runtime_gate')
+          try:
+              set_client = node.create_client(SetSimulationState, '/gzserver/set_simulation_state')
+              get_client = node.create_client(GetSimulationState, '/gzserver/get_simulation_state')
+              assert set_client.wait_for_service(timeout_sec=10.0)
+              assert get_client.wait_for_service(timeout_sec=10.0)
+
+              def set_state(state):
+                  request = SetSimulationState.Request()
+                  request.state.state = state
+                  future = set_client.call_async(request)
+                  rclpy.spin_until_future_complete(node, future, timeout_sec=10.0)
+                  assert future.done(), 'set_simulation_state did not respond'
+                  response = future.result()
+                  assert response is not None
+                  assert response.result.result == Result.RESULT_OK, response.result.error_message
+                  return response
+
+              def get_state():
+                  request = GetSimulationState.Request()
+                  future = get_client.call_async(request)
+                  rclpy.spin_until_future_complete(node, future, timeout_sec=10.0)
+                  assert future.done(), 'get_simulation_state did not respond'
+                  response = future.result()
+                  assert response is not None
+                  assert response.result.result == Result.RESULT_OK, response.result.error_message
+                  return response.state.state
+
+              set_state(SimulationState.STATE_PLAYING)
+              playing_state = get_state()
+              print('PLAYING state:', playing_state)
+              assert playing_state == SimulationState.STATE_PLAYING, playing_state
+
+              stopped = set_state(SimulationState.STATE_STOPPED)
+              print('STOPPED response:', stopped.result.result, repr(stopped.result.error_message))
+
+              stopped_state = get_state()
+              print('STOPPED state:', stopped_state)
+              assert stopped_state == SimulationState.STATE_STOPPED, stopped_state
+          finally:
+              node.destroy_node()
+              rclpy.shutdown()
+          PY
