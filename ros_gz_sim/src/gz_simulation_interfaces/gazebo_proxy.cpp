@@ -77,23 +77,13 @@ GazeboProxy::GazeboProxy(const std::string world_name, std::shared_ptr<rclcpp::N
       this->UpdateStateFromMsg(reply);
       this->state_intialized_ = true;
 
-      // Listen to the "state" topic to get periodic updates.
       this->SubscribeToGzTopic(this->PrefixTopic("state"), &GazeboProxy::UpdateStateFromMsg, this);
-      // Listen to the "scene/info" to detect a reset
-      // TODO(azeey): This is a hack. We currently don't have a nice way of determining when
-      // simulation has been reset if it's currently paused. Checking if time has been rewound or
-      // the number of iterations was reset back to zero doesn't work if the simulation was started
-      // in the paused state and hasn't been played before it was reset. The SceneBroadacaster
-      // publishes on the scene/info topic every time it's reset. So we'll use that as our signal
-      // until we come up with a better way to communicate this from the server.
       std::function<void(const gz::msgs::Scene &)> resetHandler = [this](const auto &) {
           {
             std::lock_guard<std::mutex> lk(this->reset_detected_mutex_);
             this->reset_detected_ = true;
             this->reset_detected_cv_.notify_all();
           }
-          // Use std::async since InitializeAllCanonicalLinks eventually makes a service call, which
-          // we don't want to do from this callback thread.
           this->initialize_canonical_links_ =
             std::async(std::launch::async, [this] {this->InitializeAllCanonicalLinks();});
         };
@@ -110,15 +100,9 @@ GazeboProxy::GazeboProxy(const std::string world_name, std::shared_ptr<rclcpp::N
         this->world_stats_cv_.notify_all();
       };
 
-    // Listen to the stats topic to get more frequently updates world statistics.
     this->SubscribeToGzTopic(this->PrefixTopic("stats"), updateStats);
   }
 
-  // Before creating the services, we need to add the `[Angular/Linear]Velocity` components to all
-  // the entities available. Currently, we're treating entities are models, but Gazebo doesn't
-  // update velocity components of models. Therefore, we have to set the component on the canonical
-  // link and compute the velocity of the model entity manually here.
-  // TODO(azeey): Compute model velocities on the Gazebo server.
   this->InitializeAllCanonicalLinks();
 }
 
@@ -177,16 +161,12 @@ bool GazeboProxy::StateInitialized() const {return this->state_intialized_;}
 
 bool GazeboProxy::WaitForUpdatedState(const std::chrono::milliseconds & timeout)
 {
-  // If the state has not been initialized, it will not be continuously updated, so return early.
   if (!state_intialized_) {
     return false;
   }
   if (this->initialize_canonical_links_.valid()) {
-    // Wait if canonical links need to be initialized. This should only happen on reset.
     this->initialize_canonical_links_.wait_for(timeout);
   }
-  // TODO(azeey): Technically we should subtract the amount of time the `wait_for` above used up
-  // from the timeout when we use it for the second `wait_for` below.
   std::unique_lock lk(this->state_sync_mutex_);
   this->state_updated_ = false;
   return this->state_cv_.wait_for(lk, timeout, [this] {return this->state_updated_;});
@@ -254,7 +234,6 @@ bool GazeboProxy::InitializeGazeboConnection()
 bool GazeboProxy::WaitForCriticalServices()
 {
   bool have_all_services = true;
-  // Check that services from SceneBroadacaster are available
   {
     const auto state_service = this->PrefixTopic("state");
     if (!this->WaitForGzService(state_service)) {
@@ -325,7 +304,6 @@ void GazeboProxy::InitializeAllCanonicalLinks()
 void GazeboProxy::InitializeCanonicalLinks(
   const std::unordered_set<gz::sim::Entity> & canonicalLinkEntities)
 {
-  // TODO(azeey) Computing velocities at every timestep might have a performance impact
   for (const auto & link : canonicalLinkEntities) {
     this->ecm_.CreateComponent(link, components::WorldPose());
     this->ecm_.CreateComponent(link, components::WorldLinearVelocity());
@@ -333,6 +311,7 @@ void GazeboProxy::InitializeCanonicalLinks(
   }
 
   gz::msgs::WorldControlState control_msg;
+  control_msg.mutable_world_control()->set_pause(this->Paused());
   control_msg.mutable_state()->CopyFrom(this->ecm_.State(
     canonicalLinkEntities, {components::WorldPose::typeId, components::WorldLinearVelocity::typeId,
         components::WorldAngularVelocity::typeId}));
