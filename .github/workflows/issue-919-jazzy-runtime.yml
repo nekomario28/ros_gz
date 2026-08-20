@@ -1,0 +1,132 @@
+name: Issue 919 Jazzy runtime gate
+
+on:
+  pull_request:
+    branches:
+      - jazzy
+
+permissions:
+  contents: read
+
+jobs:
+  runtime-gate:
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:noble
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Jazzy build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y -qq ca-certificates curl gnupg lsb-release build-essential
+          install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL https://packages.osrfoundation.org/gazebo.gpg \
+            -o /etc/apt/keyrings/pkgs-osrf-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/pkgs-osrf-archive-keyring.gpg] http://packages.osrfoundation.org/gazebo/ubuntu-stable noble main" \
+            > /etc/apt/sources.list.d/gazebo-stable.list
+          curl -fsSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
+            -o /etc/apt/keyrings/ros-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu noble main" \
+            > /etc/apt/sources.list.d/ros2.list
+          apt-get update -qq
+          apt-get install -y python3-colcon-common-extensions python3-rosdep libcli11-dev ros-jazzy-ros-base
+          rosdep init
+          rosdep update --rosdistro jazzy
+          rosdep install --from-paths . -i -y -r --rosdistro jazzy
+
+      - name: Build ros_gz_sim from Jazzy source
+        shell: bash
+        run: |
+          set -euo pipefail
+          source /opt/ros/jazzy/setup.bash
+          mkdir -p ~/ws/src
+          cp -r "$GITHUB_WORKSPACE" ~/ws/src/ros_gz
+          cd ~/ws
+          colcon build --packages-up-to ros_gz_sim --event-handlers console_direct+
+
+      - name: Run ros_gz_sim tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          source /opt/ros/jazzy/setup.bash
+          source ~/ws/install/setup.bash
+          cd ~/ws
+          colcon test --packages-select ros_gz_sim --event-handlers console_direct+
+          colcon test-result --verbose
+
+      - name: Verify PLAYING to STOPPED on real gzserver
+        shell: bash
+        run: |
+          set -euo pipefail
+          source /opt/ros/jazzy/setup.bash
+          source ~/ws/install/setup.bash
+
+          world_file="$(find /opt/ros/jazzy -type f -path '*/gz-sim8/worlds/shapes.sdf' -print -quit)"
+          if [ -z "$world_file" ]; then
+            world_file="$(find /opt/ros/jazzy -type f -path '*/worlds/shapes.sdf' -print -quit)"
+          fi
+          test -n "$world_file"
+          echo "Using world: $world_file"
+
+          ros2 run ros_gz_sim gzserver --ros-args -p world_sdf_file:="$world_file" > /tmp/issue919-gzserver.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; cat /tmp/issue919-gzserver.log || true' EXIT
+
+          for _ in $(seq 1 60); do
+            if ros2 service type /gzserver/set_simulation_state >/dev/null 2>&1 && \
+               ros2 service type /gzserver/get_simulation_state >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          ros2 service type /gzserver/set_simulation_state
+          ros2 service type /gzserver/get_simulation_state
+
+          python3 - <<'PY'
+          import rclpy
+          from simulation_interfaces.msg import Result, SimulationState
+          from simulation_interfaces.srv import GetSimulationState, SetSimulationState
+
+          rclpy.init()
+          node = rclpy.create_node('issue_919_jazzy_runtime_gate')
+          try:
+              set_client = node.create_client(SetSimulationState, '/gzserver/set_simulation_state')
+              get_client = node.create_client(GetSimulationState, '/gzserver/get_simulation_state')
+              assert set_client.wait_for_service(timeout_sec=10.0)
+              assert get_client.wait_for_service(timeout_sec=10.0)
+
+              def set_state(state):
+                  request = SetSimulationState.Request()
+                  request.state.state = state
+                  future = set_client.call_async(request)
+                  rclpy.spin_until_future_complete(node, future, timeout_sec=10.0)
+                  assert future.done(), 'set_simulation_state did not respond'
+                  response = future.result()
+                  assert response is not None
+                  print('set_state', state, '=>', response.result.result, repr(response.result.error_message))
+                  assert response.result.result == Result.RESULT_OK, response.result.error_message
+
+              def get_state():
+                  request = GetSimulationState.Request()
+                  future = get_client.call_async(request)
+                  rclpy.spin_until_future_complete(node, future, timeout_sec=10.0)
+                  assert future.done(), 'get_simulation_state did not respond'
+                  response = future.result()
+                  assert response is not None
+                  assert response.result.result == Result.RESULT_OK, response.result.error_message
+                  print('get_state =>', response.state.state)
+                  return response.state.state
+
+              set_state(SimulationState.STATE_PLAYING)
+              assert get_state() == SimulationState.STATE_PLAYING
+              set_state(SimulationState.STATE_STOPPED)
+              assert get_state() == SimulationState.STATE_STOPPED
+          finally:
+              node.destroy_node()
+              rclpy.shutdown()
+          PY
