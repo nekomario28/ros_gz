@@ -43,12 +43,12 @@ jobs:
           DOCKER_IMAGE: ${{ matrix.docker-image }}
           ROS_DISTRO: ${{ matrix.ros-distro }}
       - name: Report first failure to diagnostic PR
-        if: ${{ failure() && github.event_name == 'pull_request' }}
+        if: ${{ failure() }}
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPOSITORY: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          RUN_HEAD: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: 3
+          RUN_HEAD: ${{ github.sha }}
         run: |
           python3 - <<'PY'
           import json
