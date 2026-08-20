@@ -1,0 +1,82 @@
+name: Apply reset detection race fix
+
+on:
+  push:
+    branches:
+      - diag/919-jazzy-runtime
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: diag/919-jazzy-runtime
+          fetch-depth: 0
+
+      - name: Apply arm-reset-wait fix
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f'{path}: expected one match, got {count}')
+              p.write_text(text.replace(old, new, 1))
+
+          proxy_cpp = 'ros_gz_sim/src/gz_simulation_interfaces/gazebo_proxy.cpp'
+          replace_once(
+              proxy_cpp,
+              '''bool GazeboProxy::WaitForResetDetected()\n{\n  std::unique_lock lk(this->reset_detected_mutex_);\n  this->reset_detected_ = false;\n  if(!this->reset_detected_cv_.wait_for(\n    lk, std::chrono::milliseconds(kGzServiceTimeoutMs), [this] {return this->reset_detected_;}))\n  {\n    return false;\n  }\n  return this->reset_detected_;\n}\n''',
+              '''void GazeboProxy::ArmResetDetection()\n{\n  std::lock_guard<std::mutex> lk(this->reset_detected_mutex_);\n  this->reset_detected_ = false;\n}\n\nbool GazeboProxy::WaitForResetDetected()\n{\n  std::unique_lock lk(this->reset_detected_mutex_);\n  if (!this->reset_detected_cv_.wait_for(\n    lk, std::chrono::milliseconds(kGzServiceTimeoutMs), [this] {return this->reset_detected_;}))\n  {\n    return false;\n  }\n  return this->reset_detected_;\n}\n''')
+
+          proxy_hpp = 'ros_gz_sim/src/gz_simulation_interfaces/gazebo_proxy.hpp'
+          replace_once(
+              proxy_hpp,
+              '''  /// \\brief Wait until simulation reset is detected\n  /// \\return True if reset was detected.\n  bool WaitForResetDetected();\n''',
+              '''  /// \\brief Arm reset detection before sending a reset request.\n  void ArmResetDetection();\n\n  /// \\brief Wait until simulation reset is detected.\n  /// \\return True if reset was detected.\n  bool WaitForResetDetected();\n''')
+
+          reset_cpp = 'ros_gz_sim/src/gz_simulation_interfaces/services/reset_simulation.cpp'
+          replace_once(reset_cpp, '#include <future>\n', '')
+          replace_once(
+              reset_cpp,
+              '''      auto reset_detected_future = std::async(std::launch::async, [this]\n      {\n        return this->gz_proxy_->WaitForResetDetected();\n      });\n\n''',
+              '')
+          replace_once(
+              reset_cpp,
+              '''      bool result;\n      gz::msgs::Boolean reply;\n      bool executed = this->gz_proxy_->GzNode()->Request(\n''',
+              '''      this->gz_proxy_->ArmResetDetection();\n      bool result;\n      gz::msgs::Boolean reply;\n      bool executed = this->gz_proxy_->GzNode()->Request(\n''')
+          replace_once(reset_cpp, '      if (!reset_detected_future.get()) {\n',
+                       '      if (!this->gz_proxy_->WaitForResetDetected()) {\n')
+
+          set_cpp = 'ros_gz_sim/src/gz_simulation_interfaces/services/set_simulation_state.cpp'
+          replace_once(set_cpp, '#include <future>\n', '')
+          replace_once(
+              set_cpp,
+              '''        auto reset_detected_future = std::async(std::launch::async, [this]\n        {\n          return this->gz_proxy_->WaitForResetDetected();\n        });\n''',
+              '''        this->gz_proxy_->ArmResetDetection();\n''')
+          replace_once(set_cpp, '        if (!reset_detected_future.get()) {\n',
+                       '        if (!this->gz_proxy_->WaitForResetDetected()) {\n')
+          PY
+
+          git rm .github/workflows/apply-reset-detection-race-fix.yml
+          git diff --check
+          git config user.name nekomario28
+          git config user.email 206304251+nekomario28@users.noreply.github.com
+          git add ros_gz_sim/src/gz_simulation_interfaces/gazebo_proxy.cpp \
+                  ros_gz_sim/src/gz_simulation_interfaces/gazebo_proxy.hpp \
+                  ros_gz_sim/src/gz_simulation_interfaces/services/reset_simulation.cpp \
+                  ros_gz_sim/src/gz_simulation_interfaces/services/set_simulation_state.cpp
+          git commit -m 'Avoid reset detection lost wakeups' \
+            -m 'Arm reset detection synchronously before sending the reset request, then wait without clearing the signal. This removes the race where an early reset notification could be erased by an asynchronously-started waiter.' \
+            -m 'Signed-off-by: Yuu <206304251+nekomario28@users.noreply.github.com>' \
+            -m 'Assisted-by: ChatGPT (GPT-5.6 Sol)'
+          git push origin HEAD:diag/919-jazzy-runtime
