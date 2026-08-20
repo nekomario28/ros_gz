@@ -327,6 +327,9 @@ void GazeboProxy::InitializeCanonicalLinks(
   }
 
   gz::msgs::WorldControlState control_msg;
+  // Gazebo applies world_control even when this request is only synchronizing state. Preserve the
+  // current pause state so canonical-link synchronization doesn't implicitly unpause simulation.
+  control_msg.mutable_world_control()->set_pause(this->Paused());
   control_msg.mutable_state()->CopyFrom(this->ecm_.State(
     canonicalLinkEntities, {components::WorldPose::typeId, components::WorldLinearVelocity::typeId,
         components::WorldAngularVelocity::typeId}));
