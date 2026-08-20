@@ -58,9 +58,9 @@ SetSimulationState::SetSimulationState(
           // guaranteed to publish another update after the reset while paused, so use the same
           // reset-completion signal as ResetSimulation instead of waiting on an ECM state update.
           reset_detected_future = std::async(std::launch::async, [this]
-            {
-              return this->gz_proxy_->WaitForResetDetected();
-            });
+          {
+            return this->gz_proxy_->WaitForResetDetected();
+          });
           gz_request.set_pause(true);
           gz_request.mutable_reset()->set_all(true);
           break;
@@ -107,7 +107,9 @@ SetSimulationState::SetSimulationState(
         bool state_reached = this->gz_proxy_->Paused();
         auto t_init = std::chrono::steady_clock::now();
         auto timeout = std::chrono::milliseconds(GazeboProxy::kGzStateUpdatedTimeoutMs);
-        while (!state_reached && (std::chrono::steady_clock::now() - t_init) < timeout) {
+        while (
+          !state_reached && (std::chrono::steady_clock::now() - t_init) < timeout)
+        {
           if (!this->gz_proxy_->AssertUpdatedWorldStats(response->result)) {
             return;
           }
