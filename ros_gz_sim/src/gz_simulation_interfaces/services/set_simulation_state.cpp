@@ -50,19 +50,12 @@ SetSimulationState::SetSimulationState(
       using Result = simulation_interfaces::msg::Result;
       using SimulationState = simulation_interfaces::msg::SimulationState;
 
-      std::future<bool> reset_detected_future;
       gz::msgs::WorldControl gz_request;
       switch (request->state.state) {
         case SimulationState::STATE_STOPPED:
-          // A stopped simulation is a paused simulation after a full reset. The state topic is not
-          // guaranteed to publish another update after the reset while paused, so use the same
-          // reset-completion signal as ResetSimulation instead of waiting on an ECM state update.
-          reset_detected_future = std::async(std::launch::async, [this]
-          {
-            return this->gz_proxy_->WaitForResetDetected();
-          });
+          // STOPPED is a two-stage transition. Pause first so reset-time state synchronization
+          // cannot race the pause request, then reset while preserving the paused state.
           gz_request.set_pause(true);
-          gz_request.mutable_reset()->set_all(true);
           break;
         case SimulationState::STATE_PAUSED:
           gz_request.set_pause(true);
@@ -93,17 +86,10 @@ SetSimulationState::SetSimulationState(
       }
       response->result.result = Result::RESULT_OK;
 
-      // STATE_STOPPED includes a full reset. Gazebo's SceneBroadcaster publishes scene/info when
-      // that reset occurs, including when the simulation is paused and no further state update is
-      // emitted. Wait for that signal first, then ensure the pause part of the request is visible in
-      // world statistics.
       if (request->state.state == SimulationState::STATE_STOPPED) {
-        if (!reset_detected_future.get()) {
-          response->result.result = Result::RESULT_OPERATION_FAILED;
-          response->result.error_message = "Timed out while trying to reset simulation";
-          return;
-        }
-
+        // The Gazebo control service only acknowledges that a command was queued. Wait until pause
+        // is observable in world statistics before issuing the reset so reset-time control/state
+        // synchronization preserves the correct pause state.
         bool state_reached = this->gz_proxy_->Paused();
         auto t_init = std::chrono::steady_clock::now();
         auto timeout = std::chrono::milliseconds(GazeboProxy::kGzStateUpdatedTimeoutMs);
@@ -114,6 +100,52 @@ SetSimulationState::SetSimulationState(
             return;
           }
           state_reached = this->gz_proxy_->Paused();
+        }
+        if (!state_reached) {
+          response->result.result = Result::RESULT_OPERATION_FAILED;
+          response->result.error_message = "Timed out while trying to pause simulation";
+          return;
+        }
+
+        // SceneBroadcaster provides the reset-completion signal even while paused. Arm that wait
+        // before the reset request, then issue a full reset with pause explicitly preserved.
+        auto reset_detected_future = std::async(std::launch::async, [this]
+        {
+          return this->gz_proxy_->WaitForResetDetected();
+        });
+        gz::msgs::WorldControl reset_request;
+        reset_request.set_pause(true);
+        reset_request.mutable_reset()->set_all(true);
+        executed = this->gz_proxy_->GzNode()->Request(
+          control_service, reset_request, GazeboProxy::kGzServiceTimeoutMs, reply, result);
+        if (!executed) {
+          response->result.result = Result::RESULT_OPERATION_FAILED;
+          response->result.error_message = "Timed out while trying to reset simulation";
+          return;
+        }
+        if (!result || !reply.data()) {
+          response->result.result = Result::RESULT_OPERATION_FAILED;
+          response->result.error_message = "Unknown error while trying to reset simulation";
+          return;
+        }
+        if (!reset_detected_future.get()) {
+          response->result.result = Result::RESULT_OPERATION_FAILED;
+          response->result.error_message = "Timed out while trying to reset simulation";
+          return;
+        }
+
+        // STATE_STOPPED is represented by paused world statistics with the iteration counter reset
+        // to zero. Observe both conditions instead of treating the transport acknowledgement as
+        // completion.
+        state_reached = this->gz_proxy_->Paused() && (this->gz_proxy_->Iterations() == 0);
+        t_init = std::chrono::steady_clock::now();
+        while (
+          !state_reached && (std::chrono::steady_clock::now() - t_init) < timeout)
+        {
+          if (!this->gz_proxy_->AssertUpdatedWorldStats(response->result)) {
+            return;
+          }
+          state_reached = this->gz_proxy_->Paused() && (this->gz_proxy_->Iterations() == 0);
         }
         if (!state_reached) {
           response->result.result = Result::RESULT_OPERATION_FAILED;
