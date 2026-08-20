@@ -48,6 +48,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           python3 - <<'PY'
           import json
@@ -62,7 +63,8 @@ jobs:
           repo = os.environ['GH_REPOSITORY']
           pr_number = os.environ['PR_NUMBER']
           url = f'https://api.github.com/repos/{repo}/issues/{pr_number}/comments'
-          payload = json.dumps({'body': path.read_text()}).encode()
+          body = f"Diagnostic head: `{os.environ['RUN_HEAD']}`\n\n" + path.read_text()
+          payload = json.dumps({'body': body}).encode()
           req = request.Request(
               url,
               data=payload,
