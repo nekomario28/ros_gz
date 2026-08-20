@@ -40,14 +40,31 @@ jobs:
           rosdep install --from-paths . -i -y -r --rosdistro jazzy
 
       - name: Build ros_gz_sim from Jazzy source
+        id: build
+        continue-on-error: true
         shell: bash
         run: |
-          set -euo pipefail
+          set -o pipefail
           source /opt/ros/jazzy/setup.bash
           mkdir -p ~/ws/src
           cp -r "$GITHUB_WORKSPACE" ~/ws/src/ros_gz
           cd ~/ws
-          colcon build --packages-up-to ros_gz_sim --event-handlers console_direct+
+          colcon build --packages-up-to ros_gz_sim --event-handlers console_direct+ \
+            2>&1 | tee /tmp/issue919-jazzy-runtime-build.log
+
+      - name: Upload runtime build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue-919-jazzy-runtime-build-log
+          path: |
+            /tmp/issue919-jazzy-runtime-build.log
+            /root/ws/log/latest_build
+          if-no-files-found: warn
+
+      - name: Preserve runtime build result
+        if: steps.build.outcome == 'failure'
+        run: exit 1
 
       - name: Run ros_gz_sim tests
         shell: bash
