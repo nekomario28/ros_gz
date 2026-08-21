@@ -103,7 +103,7 @@ jobs:
       - name: Verify PLAYING to STOPPED on real gzserver
         shell: bash
         run: |
-          set -euo pipefail
+          set -eo pipefail
           source /opt/ros/jazzy/setup.bash
           source ~/ws/install/setup.bash
 
