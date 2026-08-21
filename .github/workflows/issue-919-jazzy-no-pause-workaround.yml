@@ -1,0 +1,155 @@
+name: Issue 919 Jazzy subtractive no-pause-workaround
+
+on:
+  pull_request:
+    branches:
+      - jazzy
+
+permissions:
+  contents: read
+
+jobs:
+  no-pause-workaround:
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:noble
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Remove ros_gz pause workaround in checkout
+        shell: bash
+        run: |
+          set -e
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('ros_gz_sim/src/gz_simulation_interfaces/gazebo_proxy.cpp')
+          text = path.read_text()
+          old = '''  // Gazebo applies world_control even when this request is only synchronizing state. Preserve the
+  // current pause state so canonical-link synchronization doesn't implicitly unpause simulation.
+  control_msg.mutable_world_control()->set_pause(this->Paused());
+'''
+          if text.count(old) != 1:
+              raise RuntimeError(f'expected one pause-workaround block, got {text.count(old)}')
+          path.write_text(text.replace(old, '', 1))
+          PY
+          git diff --check
+          git diff -- ros_gz_sim/src/gz_simulation_interfaces/gazebo_proxy.cpp | tee /tmp/issue919-subtractive.patch
+
+      - name: Install Jazzy build dependencies
+        shell: bash
+        run: |
+          set -e
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y -qq ca-certificates curl gnupg lsb-release build-essential
+          install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL https://packages.osrfoundation.org/gazebo.gpg \
+            -o /etc/apt/keyrings/pkgs-osrf-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/pkgs-osrf-archive-keyring.gpg] http://packages.osrfoundation.org/gazebo/ubuntu-stable noble main" \
+            > /etc/apt/sources.list.d/gazebo-stable.list
+          curl -fsSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
+            -o /etc/apt/keyrings/ros-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu noble main" \
+            > /etc/apt/sources.list.d/ros2.list
+          apt-get update -qq
+          apt-get install -y python3-colcon-common-extensions python3-rosdep libcli11-dev ros-jazzy-ros-base
+          rosdep init
+          rosdep update --rosdistro jazzy
+          rosdep install --from-paths . -i -y -r --rosdistro jazzy
+
+      - name: Build ros_gz_sim variant
+        shell: bash
+        run: |
+          set -o pipefail
+          source /opt/ros/jazzy/setup.bash
+          mkdir -p ~/ws/src
+          cp -r "$GITHUB_WORKSPACE" ~/ws/src/ros_gz
+          cd ~/ws
+          colcon build --packages-up-to ros_gz_sim --event-handlers console_direct+ \
+            2>&1 | tee /tmp/issue919-subtractive-build.log
+
+      - name: Verify PLAYING to STOPPED without pause workaround
+        shell: bash
+        run: |
+          set -eo pipefail
+          source /opt/ros/jazzy/setup.bash
+          source ~/ws/install/setup.bash
+
+          world_file="$(find /opt/ros/jazzy -type f -path '*/gz-sim8/worlds/shapes.sdf' -print -quit)"
+          if [ -z "$world_file" ]; then
+            world_file="$(find /opt/ros/jazzy -type f -path '*/worlds/shapes.sdf' -print -quit)"
+          fi
+          test -n "$world_file"
+          echo "Using world: $world_file"
+
+          ros2 run ros_gz_sim gzserver --ros-args -p world_sdf_file:="$world_file" > /tmp/issue919-subtractive-gzserver.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
+
+          for _ in $(seq 1 60); do
+            if ros2 service type /gzserver/set_simulation_state >/dev/null 2>&1 && \
+               ros2 service type /gzserver/get_simulation_state >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          ros2 service type /gzserver/set_simulation_state
+          ros2 service type /gzserver/get_simulation_state
+
+          python3 - <<'PY' 2>&1 | tee /tmp/issue919-subtractive-result.log
+          import rclpy
+          from simulation_interfaces.msg import Result, SimulationState
+          from simulation_interfaces.srv import GetSimulationState, SetSimulationState
+
+          rclpy.init()
+          node = rclpy.create_node('issue_919_jazzy_no_pause_workaround')
+          try:
+              set_client = node.create_client(SetSimulationState, '/gzserver/set_simulation_state')
+              get_client = node.create_client(GetSimulationState, '/gzserver/get_simulation_state')
+              assert set_client.wait_for_service(timeout_sec=10.0)
+              assert get_client.wait_for_service(timeout_sec=10.0)
+
+              def set_state(state):
+                  request = SetSimulationState.Request()
+                  request.state.state = state
+                  future = set_client.call_async(request)
+                  rclpy.spin_until_future_complete(node, future, timeout_sec=10.0)
+                  assert future.done(), 'set_simulation_state did not respond'
+                  response = future.result()
+                  assert response is not None
+                  print('set_state', state, '=>', response.result.result, repr(response.result.error_message), flush=True)
+                  assert response.result.result == Result.RESULT_OK, response.result.error_message
+
+              def get_state():
+                  request = GetSimulationState.Request()
+                  future = get_client.call_async(request)
+                  rclpy.spin_until_future_complete(node, future, timeout_sec=10.0)
+                  assert future.done(), 'get_simulation_state did not respond'
+                  response = future.result()
+                  assert response is not None
+                  print('get_state result/state =>', response.result.result, response.state.state, repr(response.result.error_message), flush=True)
+                  assert response.result.result == Result.RESULT_OK, response.result.error_message
+                  return response.state.state
+
+              set_state(SimulationState.STATE_PLAYING)
+              assert get_state() == SimulationState.STATE_PLAYING
+              set_state(SimulationState.STATE_STOPPED)
+              assert get_state() == SimulationState.STATE_STOPPED
+          finally:
+              node.destroy_node()
+              rclpy.shutdown()
+          PY
+
+      - name: Upload subtractive evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue-919-jazzy-no-pause-workaround-evidence
+          path: |
+            /tmp/issue919-subtractive.patch
+            /tmp/issue919-subtractive-build.log
+            /tmp/issue919-subtractive-result.log
+            /tmp/issue919-subtractive-gzserver.log
+          if-no-files-found: warn
