@@ -69,7 +69,7 @@ jobs:
       - name: Run ros_gz_sim tests
         shell: bash
         run: |
-          set -uo pipefail
+          set -o pipefail
           source /opt/ros/jazzy/setup.bash
           source ~/ws/install/setup.bash
           cd ~/ws
