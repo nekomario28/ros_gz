@@ -17,28 +17,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Remove ros_gz pause workaround in checkout
-        shell: bash
-        run: |
-          set -e
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path('ros_gz_sim/src/gz_simulation_interfaces/gazebo_proxy.cpp')
-          text = path.read_text()
-          old = '''  // Gazebo applies world_control even when this request is only synchronizing state. Preserve the
-  // current pause state so canonical-link synchronization doesn't implicitly unpause simulation.
-  control_msg.mutable_world_control()->set_pause(this->Paused());
-'''
-          count = text.count(old)
-          if count != 1:
-              raise RuntimeError(f'expected one pause-workaround block, got {count}')
-          path.write_text(text.replace(old, '', 1))
-          PY
-          git diff --check
-          git diff -- ros_gz_sim/src/gz_simulation_interfaces/gazebo_proxy.cpp \
-            | tee /tmp/issue919-jazzy-subtractive.patch
-
       - name: Install Jazzy build dependencies
         shell: bash
         run: |
@@ -150,7 +128,7 @@ jobs:
           ros2 service type /gzserver/set_simulation_state
           ros2 service type /gzserver/get_simulation_state
 
-          python3 - <<'PY' 2>&1 | tee /tmp/issue919-jazzy-runtime-result.log
+          python3 - <<'PY'
           import rclpy
           from simulation_interfaces.msg import Result, SimulationState
           from simulation_interfaces.srv import GetSimulationState, SetSimulationState
@@ -171,7 +149,7 @@ jobs:
                   assert future.done(), 'set_simulation_state did not respond'
                   response = future.result()
                   assert response is not None
-                  print('set_state', state, '=>', response.result.result, repr(response.result.error_message), flush=True)
+                  print('set_state', state, '=>', response.result.result, repr(response.result.error_message))
                   assert response.result.result == Result.RESULT_OK, response.result.error_message
 
               def get_state():
@@ -181,8 +159,8 @@ jobs:
                   assert future.done(), 'get_simulation_state did not respond'
                   response = future.result()
                   assert response is not None
-                  print('get_state result/state =>', response.result.result, response.state.state, repr(response.result.error_message), flush=True)
                   assert response.result.result == Result.RESULT_OK, response.result.error_message
+                  print('get_state =>', response.state.state)
                   return response.state.state
 
               set_state(SimulationState.STATE_PLAYING)
@@ -193,14 +171,3 @@ jobs:
               node.destroy_node()
               rclpy.shutdown()
           PY
-
-      - name: Upload real gzserver evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: issue-919-jazzy-real-gzserver-evidence
-          path: |
-            /tmp/issue919-jazzy-subtractive.patch
-            /tmp/issue919-jazzy-runtime-result.log
-            /tmp/issue919-gzserver.log
-          if-no-files-found: warn
