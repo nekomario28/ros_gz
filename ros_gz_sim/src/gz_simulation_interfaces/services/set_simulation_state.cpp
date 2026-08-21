@@ -52,8 +52,9 @@ SetSimulationState::SetSimulationState(
       gz::msgs::WorldControl gz_request;
       switch (request->state.state) {
         case SimulationState::STATE_STOPPED:
+          // STOPPED is a two-stage transition. Pause first so reset-time state synchronization
+          // cannot race the pause request, then reset while preserving the paused state.
           gz_request.set_pause(true);
-          gz_request.mutable_reset()->set_all(true);
           break;
         case SimulationState::STATE_PAUSED:
           gz_request.set_pause(true);
@@ -75,11 +76,78 @@ SetSimulationState::SetSimulationState(
       if (!executed) {
         response->result.result = Result::RESULT_OPERATION_FAILED;
         response->result.error_message = "Timed out while trying to set simulation state";
-      } else if (result && reply.data()) {
-        response->result.result = Result::RESULT_OK;
-      } else {
+        return;
+      }
+      if (!result || !reply.data()) {
         response->result.result = Result::RESULT_OPERATION_FAILED;
-        response->result.error_message = "Unknown error while trying to reset simulation";
+        response->result.error_message = "Unknown error while trying to set simulation state";
+        return;
+      }
+      response->result.result = Result::RESULT_OK;
+
+      if (request->state.state == SimulationState::STATE_STOPPED) {
+        // The Gazebo control service only acknowledges that a command was queued. Wait until pause
+        // is observable in world statistics before issuing the reset so reset-time control/state
+        // synchronization preserves the correct pause state.
+        bool state_reached = this->gz_proxy_->Paused();
+        auto t_init = std::chrono::steady_clock::now();
+        auto timeout = std::chrono::milliseconds(GazeboProxy::kGzStateUpdatedTimeoutMs);
+        while (
+          !state_reached && (std::chrono::steady_clock::now() - t_init) < timeout)
+        {
+          if (!this->gz_proxy_->AssertUpdatedWorldStats(response->result)) {
+            return;
+          }
+          state_reached = this->gz_proxy_->Paused();
+        }
+        if (!state_reached) {
+          response->result.result = Result::RESULT_OPERATION_FAILED;
+          response->result.error_message = "Timed out while trying to pause simulation";
+          return;
+        }
+
+        // SceneBroadcaster provides the reset-completion signal even while paused. Arm that wait
+        // before the reset request, then issue a full reset with pause explicitly preserved.
+        this->gz_proxy_->ArmResetDetection();
+        gz::msgs::WorldControl reset_request;
+        reset_request.set_pause(true);
+        reset_request.mutable_reset()->set_all(true);
+        executed = this->gz_proxy_->GzNode()->Request(
+          control_service, reset_request, GazeboProxy::kGzServiceTimeoutMs, reply, result);
+        if (!executed) {
+          response->result.result = Result::RESULT_OPERATION_FAILED;
+          response->result.error_message = "Timed out while trying to reset simulation";
+          return;
+        }
+        if (!result || !reply.data()) {
+          response->result.result = Result::RESULT_OPERATION_FAILED;
+          response->result.error_message = "Unknown error while trying to reset simulation";
+          return;
+        }
+        if (!this->gz_proxy_->WaitForResetDetected()) {
+          response->result.result = Result::RESULT_OPERATION_FAILED;
+          response->result.error_message = "Timed out while trying to reset simulation";
+          return;
+        }
+
+        // STATE_STOPPED is represented by paused world statistics with the iteration counter reset
+        // to zero. Observe both conditions instead of treating the transport acknowledgement as
+        // completion.
+        state_reached = this->gz_proxy_->Paused() && (this->gz_proxy_->Iterations() == 0);
+        t_init = std::chrono::steady_clock::now();
+        while (
+          !state_reached && (std::chrono::steady_clock::now() - t_init) < timeout)
+        {
+          if (!this->gz_proxy_->AssertUpdatedWorldStats(response->result)) {
+            return;
+          }
+          state_reached = this->gz_proxy_->Paused() && (this->gz_proxy_->Iterations() == 0);
+        }
+        if (!state_reached) {
+          response->result.result = Result::RESULT_OPERATION_FAILED;
+          response->result.error_message = "Timed out while trying to stop simulation";
+        }
+        return;
       }
 
       // Since the "control" service is asynchronous, getting results from the service doesn't mean
@@ -89,13 +157,10 @@ SetSimulationState::SetSimulationState(
       auto t_init = std::chrono::steady_clock::now();
       auto timeout = std::chrono::milliseconds(GazeboProxy::kGzStateUpdatedTimeoutMs);
       while (!state_reached && (std::chrono::steady_clock::now() - t_init) < timeout) {
-        this->gz_proxy_->AssertUpdatedState(response->result);
+        if (!this->gz_proxy_->AssertUpdatedState(response->result)) {
+          return;
+        }
         switch (request->state.state) {
-          case SimulationState::STATE_STOPPED:
-            if (this->gz_proxy_->Paused() && (this->gz_proxy_->Iterations() == 0)) {
-              state_reached = true;
-            }
-            break;
           case SimulationState::STATE_PAUSED:
             if (this->gz_proxy_->Paused()) {
               state_reached = true;
@@ -110,7 +175,7 @@ SetSimulationState::SetSimulationState(
       }
       if (!state_reached) {
         response->result.result = Result::RESULT_OPERATION_FAILED;
-        response->result.error_message = "Timed out while trying to reset simulation";
+        response->result.error_message = "Timed out while trying to set simulation state";
       }
     });
 
