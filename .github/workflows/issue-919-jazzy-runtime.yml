@@ -69,12 +69,36 @@ jobs:
       - name: Run ros_gz_sim tests
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
           source /opt/ros/jazzy/setup.bash
           source ~/ws/install/setup.bash
           cd ~/ws
-          colcon test --packages-select ros_gz_sim --event-handlers console_direct+
-          colcon test-result --verbose
+
+          set +e
+          colcon test --packages-select ros_gz_sim --event-handlers console_direct+ \
+            2>&1 | tee /tmp/issue919-jazzy-runtime-test.log
+          test_rc=${PIPESTATUS[0]}
+
+          colcon test-result --verbose \
+            2>&1 | tee /tmp/issue919-jazzy-runtime-test-result.log
+          result_rc=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$test_rc" -ne 0 ]; then
+            exit "$test_rc"
+          fi
+          exit "$result_rc"
+
+      - name: Upload runtime test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue-919-jazzy-runtime-test-evidence
+          path: |
+            /tmp/issue919-jazzy-runtime-test.log
+            /tmp/issue919-jazzy-runtime-test-result.log
+            /root/ws/log/latest_test
+          if-no-files-found: warn
 
       - name: Verify PLAYING to STOPPED on real gzserver
         shell: bash
