@@ -17,6 +17,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Remove ros_gz pause workaround in checkout
+        shell: bash
+        run: |
+          set -e
+          file=ros_gz_sim/src/gz_simulation_interfaces/gazebo_proxy.cpp
+          grep -Fq 'control_msg.mutable_world_control()->set_pause(this->Paused());' "$file"
+          sed -i \
+            '/Gazebo applies world_control even when this request is only synchronizing state/,+2d' \
+            "$file"
+          ! grep -Fq 'control_msg.mutable_world_control()->set_pause(this->Paused());' "$file"
+          grep -n -C 3 'WorldControlState control_msg' "$file" \
+            | tee /tmp/issue919-jazzy-subtractive.patch
+
       - name: Install Jazzy build dependencies
         shell: bash
         run: |
@@ -128,7 +141,7 @@ jobs:
           ros2 service type /gzserver/set_simulation_state
           ros2 service type /gzserver/get_simulation_state
 
-          python3 - <<'PY'
+          python3 - <<'PY' 2>&1 | tee /tmp/issue919-subtractive-result.log
           import rclpy
           from simulation_interfaces.msg import Result, SimulationState
           from simulation_interfaces.srv import GetSimulationState, SetSimulationState
@@ -149,7 +162,7 @@ jobs:
                   assert future.done(), 'set_simulation_state did not respond'
                   response = future.result()
                   assert response is not None
-                  print('set_state', state, '=>', response.result.result, repr(response.result.error_message))
+                  print('set_state', state, '=>', response.result.result, repr(response.result.error_message), flush=True)
                   assert response.result.result == Result.RESULT_OK, response.result.error_message
 
               def get_state():
@@ -160,7 +173,7 @@ jobs:
                   response = future.result()
                   assert response is not None
                   assert response.result.result == Result.RESULT_OK, response.result.error_message
-                  print('get_state =>', response.state.state)
+                  print('get_state =>', response.state.state, flush=True)
                   return response.state.state
 
               set_state(SimulationState.STATE_PLAYING)
@@ -171,3 +184,14 @@ jobs:
               node.destroy_node()
               rclpy.shutdown()
           PY
+
+      - name: Upload subtractive evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue-919-jazzy-no-pause-workaround-evidence
+          path: |
+            /tmp/issue919-jazzy-subtractive.patch
+            /tmp/issue919-subtractive-result.log
+            /tmp/issue919-gzserver.log
+          if-no-files-found: warn
