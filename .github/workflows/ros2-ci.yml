@@ -40,15 +40,16 @@ jobs:
           from pathlib import Path
 
           path = Path('ros_gz_sim/src/gz_simulation_interfaces/gazebo_proxy.cpp')
-          text = path.read_text()
-          old = '''  // Gazebo applies world_control even when this request is only synchronizing state. Preserve the
-  // current pause state so canonical-link synchronization doesn't implicitly unpause simulation.
-  control_msg.mutable_world_control()->set_pause(this->Paused());
-'''
-          count = text.count(old)
-          if count != 1:
-              raise RuntimeError(f'expected one pause-workaround block, got {count}')
-          path.write_text(text.replace(old, '', 1))
+          lines = path.read_text().splitlines(keepends=True)
+          needle = '  control_msg.mutable_world_control()->set_pause(this->Paused());\n'
+          matches = [i for i, line in enumerate(lines) if line == needle]
+          if len(matches) != 1:
+              raise RuntimeError(f'expected one pause-workaround line, got {len(matches)}')
+          i = matches[0]
+          if i < 2 or 'Gazebo applies world_control' not in lines[i - 2]:
+              raise RuntimeError('unexpected pause-workaround context')
+          del lines[i - 2:i + 1]
+          path.write_text(''.join(lines))
           PY
           git diff --check
           git diff -- ros_gz_sim/src/gz_simulation_interfaces/gazebo_proxy.cpp \
