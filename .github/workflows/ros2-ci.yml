@@ -36,23 +36,13 @@ jobs:
         shell: bash
         run: |
           set -e
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path('ros_gz_sim/src/gz_simulation_interfaces/gazebo_proxy.cpp')
-          lines = path.read_text().splitlines(keepends=True)
-          needle = '  control_msg.mutable_world_control()->set_pause(this->Paused());\n'
-          matches = [i for i, line in enumerate(lines) if line == needle]
-          if len(matches) != 1:
-              raise RuntimeError(f'expected one pause-workaround line, got {len(matches)}')
-          i = matches[0]
-          if i < 2 or 'Gazebo applies world_control' not in lines[i - 2]:
-              raise RuntimeError('unexpected pause-workaround context')
-          del lines[i - 2:i + 1]
-          path.write_text(''.join(lines))
-          PY
-          git diff --check
-          git diff -- ros_gz_sim/src/gz_simulation_interfaces/gazebo_proxy.cpp \
+          file=ros_gz_sim/src/gz_simulation_interfaces/gazebo_proxy.cpp
+          grep -Fq 'control_msg.mutable_world_control()->set_pause(this->Paused());' "$file"
+          sed -i \
+            '/Gazebo applies world_control even when this request is only synchronizing state/,+2d' \
+            "$file"
+          ! grep -Fq 'control_msg.mutable_world_control()->set_pause(this->Paused());' "$file"
+          grep -n -C 3 'WorldControlState control_msg' "$file" \
             | tee /tmp/issue919-jazzy-subtractive.patch
 
       - name: Build and Test
