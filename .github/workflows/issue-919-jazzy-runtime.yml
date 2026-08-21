@@ -17,19 +17,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Remove ros_gz pause workaround in checkout
-        shell: bash
-        run: |
-          set -e
-          file=ros_gz_sim/src/gz_simulation_interfaces/gazebo_proxy.cpp
-          grep -Fq 'control_msg.mutable_world_control()->set_pause(this->Paused());' "$file"
-          sed -i \
-            '/Gazebo applies world_control even when this request is only synchronizing state/,+2d' \
-            "$file"
-          ! grep -Fq 'control_msg.mutable_world_control()->set_pause(this->Paused());' "$file"
-          grep -n -C 3 'WorldControlState control_msg' "$file" \
-            | tee /tmp/issue919-jazzy-subtractive.patch
-
       - name: Install Jazzy build dependencies
         shell: bash
         run: |
@@ -189,9 +176,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: issue-919-jazzy-no-pause-workaround-evidence
+          name: issue-919-jazzy-one-request-evidence
           path: |
-            /tmp/issue919-jazzy-subtractive.patch
             /tmp/issue919-subtractive-result.log
             /tmp/issue919-gzserver.log
           if-no-files-found: warn
