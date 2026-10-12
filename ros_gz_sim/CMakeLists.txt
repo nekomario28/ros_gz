@@ -72,7 +72,6 @@ target_link_libraries(delete_entity ${PROJECT_NAME}_delete_entity
                       ${builtin_interfaces_TARGETS}
                       ${geometry_msgs_TARGETS}
                       ${ros_gz_interfaces_TARGETS}
-                      ${simulation_intefaces_TARGETS}
                       rclcpp::rclcpp)
 target_include_directories(delete_entity PUBLIC ${CLI11_INCLUDE_DIRS})
 
@@ -259,6 +258,10 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   find_package(launch_testing_ament_cmake REQUIRED)
   ament_find_gtest()
+
+  ament_add_gtest(test_handler_lifetime test/test_handler_lifetime.cpp)
+  target_include_directories(test_handler_lifetime PRIVATE src/gz_simulation_interfaces)
+  target_link_libraries(test_handler_lifetime rclcpp::rclcpp)
 
   ament_add_gtest_executable(test_create test/test_create.cpp)
   ament_add_gtest_executable(test_remove test/test_remove.cpp)
