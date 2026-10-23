@@ -21,7 +21,126 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath>
+#include <limits>
+#include <string>
+
 #include <ros_gz_bridge/convert/sensor_msgs.hpp>
+
+TEST(ImageRosToGz, PreservesPaddedRows)
+{
+  sensor_msgs::msg::Image ros_msg;
+  ros_msg.width = 2;
+  ros_msg.height = 2;
+  ros_msg.encoding = "mono8";
+  ros_msg.step = 4;
+  ros_msg.data = {21, 22, 201, 202, 23, 24, 203, 204};
+
+  gz::msgs::Image gz_msg;
+  ros_gz_bridge::convert_ros_to_gz(ros_msg, gz_msg);
+
+  EXPECT_EQ(4u, gz_msg.step());
+  EXPECT_EQ(
+    std::string(ros_msg.data.begin(), ros_msg.data.end()),
+    gz_msg.data());
+}
+
+TEST(ImageGzToRos, PreservesPaddedRows)
+{
+  gz::msgs::Image gz_msg;
+  gz_msg.set_width(2);
+  gz_msg.set_height(2);
+  gz_msg.set_pixel_format_type(gz::msgs::PixelFormatType::L_INT8);
+  gz_msg.set_step(4);
+  gz_msg.set_data(std::string("\x15\x16\xc9\xca\x17\x18\xcb\xcc", 8));
+
+  sensor_msgs::msg::Image ros_msg;
+  ros_gz_bridge::convert_gz_to_ros(gz_msg, ros_msg);
+
+  EXPECT_EQ(4u, ros_msg.step);
+  EXPECT_EQ(8u, ros_msg.data.size());
+  EXPECT_EQ(23u, ros_msg.data[4]);
+  EXPECT_EQ(24u, ros_msg.data[5]);
+}
+
+TEST(ImageRosToGz, UnsetStepIsComputed)
+{
+  sensor_msgs::msg::Image ros_msg;
+  ros_msg.width = 2;
+  ros_msg.height = 2;
+  ros_msg.encoding = "rgb8";
+  ros_msg.step = 0;
+  ros_msg.data.assign(12, 7);
+
+  gz::msgs::Image gz_msg;
+  ros_gz_bridge::convert_ros_to_gz(ros_msg, gz_msg);
+
+  EXPECT_EQ(6u, gz_msg.step());
+  EXPECT_EQ(12u, gz_msg.data().size());
+}
+
+TEST(ImageGzToRos, UnsetStepIsComputed)
+{
+  gz::msgs::Image gz_msg;
+  gz_msg.set_width(2);
+  gz_msg.set_height(2);
+  gz_msg.set_pixel_format_type(gz::msgs::PixelFormatType::L_INT16);
+  gz_msg.set_data(std::string(8, '\x07'));
+
+  sensor_msgs::msg::Image ros_msg;
+  ros_gz_bridge::convert_gz_to_ros(gz_msg, ros_msg);
+
+  EXPECT_EQ(4u, ros_msg.step);
+  EXPECT_EQ(8u, ros_msg.data.size());
+}
+
+TEST(ImageRosToGz, StepSmallerThanWidthIsRejected)
+{
+  sensor_msgs::msg::Image ros_msg;
+  ros_msg.width = 4;
+  ros_msg.height = 2;
+  ros_msg.encoding = "mono8";
+  ros_msg.step = 2;
+  ros_msg.data.assign(8, 7);
+
+  gz::msgs::Image gz_msg;
+  ros_gz_bridge::convert_ros_to_gz(ros_msg, gz_msg);
+
+  EXPECT_EQ(0u, gz_msg.step());
+  EXPECT_TRUE(gz_msg.data().empty());
+}
+
+TEST(ImageRosToGz, TruncatedDataIsRejected)
+{
+  sensor_msgs::msg::Image ros_msg;
+  ros_msg.width = 640;
+  ros_msg.height = 480;
+  ros_msg.encoding = "rgb8";
+  ros_msg.step = 1920;
+  ros_msg.data.assign(1000, 7);
+
+  gz::msgs::Image gz_msg;
+  ros_gz_bridge::convert_ros_to_gz(ros_msg, gz_msg);
+
+  EXPECT_EQ(0u, gz_msg.step());
+  EXPECT_TRUE(gz_msg.data().empty());
+}
+
+TEST(ImageGzToRos, TruncatedDataIsRejected)
+{
+  gz::msgs::Image gz_msg;
+  gz_msg.set_width(640);
+  gz_msg.set_height(480);
+  gz_msg.set_pixel_format_type(gz::msgs::PixelFormatType::RGB_INT8);
+  gz_msg.set_step(1920);
+  gz_msg.set_data(std::string(1000, '\x07'));
+
+  sensor_msgs::msg::Image ros_msg;
+  ros_gz_bridge::convert_gz_to_ros(gz_msg, ros_msg);
+
+  EXPECT_EQ(0u, ros_msg.step);
+  EXPECT_TRUE(ros_msg.data.empty());
+}
 
 // ---------------------------------------------------------------------------
 // JointState ROS->GZ : gh issue #118
@@ -66,12 +185,11 @@ TEST(JointStateRosToGz, NameShorterThanPositionDoesNotOverread)
 }
 
 // ---------------------------------------------------------------------------
-// LaserScan ROS->GZ : count is computed from angle range / increment,
-// which can disagree with the actual array sizes due to FP rounding.
-// Many lidars also publish no intensities at all. The bridge must clamp
-// to the actual array sizes instead of trusting the computed count.
+// LaserScan ROS->GZ : count comes from the ranges array, not from the angle
+// range / increment, which can disagree with the array due to FP rounding.
+// Many lidars also publish no intensities at all.
 // ---------------------------------------------------------------------------
-TEST(LaserScanRosToGz, ComputedCountLargerThanRangesArrayIsClamped)
+TEST(LaserScanRosToGz, CountFollowsRangesArrayNotAngles)
 {
   sensor_msgs::msg::LaserScan ros_msg;
   ros_msg.angle_min = 0.0f;
@@ -86,10 +204,11 @@ TEST(LaserScanRosToGz, ComputedCountLargerThanRangesArrayIsClamped)
   gz::msgs::LaserScan gz_msg;
   ASSERT_NO_FATAL_FAILURE(ros_gz_bridge::convert_ros_to_gz(ros_msg, gz_msg));
 
-  EXPECT_LE(static_cast<size_t>(gz_msg.ranges_size()), ros_msg.ranges.size());
-  EXPECT_LE(
-    static_cast<size_t>(gz_msg.intensities_size()),
-    ros_msg.intensities.size());
+  EXPECT_EQ(ros_msg.ranges.size(), gz_msg.count());
+  EXPECT_EQ(ros_msg.ranges.size(), static_cast<size_t>(gz_msg.ranges_size()));
+  EXPECT_EQ(
+    ros_msg.intensities.size(),
+    static_cast<size_t>(gz_msg.intensities_size()));
 }
 
 TEST(LaserScanRosToGz, EmptyIntensitiesDoesNotOverread)
@@ -105,6 +224,25 @@ TEST(LaserScanRosToGz, EmptyIntensitiesDoesNotOverread)
   ASSERT_NO_FATAL_FAILURE(ros_gz_bridge::convert_ros_to_gz(ros_msg, gz_msg));
 
   EXPECT_EQ(0, gz_msg.intensities_size());
+}
+
+TEST(LaserScanRosToGz, PreservesInclusiveEndpointSample)
+{
+  sensor_msgs::msg::LaserScan ros_msg;
+  ros_msg.angle_min = 0.0f;
+  ros_msg.angle_max = 0.2f;
+  ros_msg.angle_increment = 0.1f;
+  ros_msg.ranges = {1.0f, 2.0f, 3.0f};
+  ros_msg.intensities = {4.0f, 5.0f, 6.0f};
+
+  gz::msgs::LaserScan gz_msg;
+  ros_gz_bridge::convert_ros_to_gz(ros_msg, gz_msg);
+
+  EXPECT_EQ(3u, gz_msg.count());
+  EXPECT_EQ(3, gz_msg.ranges_size());
+  EXPECT_EQ(3, gz_msg.intensities_size());
+  EXPECT_DOUBLE_EQ(3.0, gz_msg.ranges(2));
+  EXPECT_DOUBLE_EQ(6.0, gz_msg.intensities(2));
 }
 
 // ---------------------------------------------------------------------------
@@ -175,4 +313,72 @@ TEST(CameraInfoGzToRos, IntrinsicsLongerThanRosArrayDoesNotOverflow)
   for (size_t i = 0; i < ros_msg.r.size(); ++i) {
     EXPECT_DOUBLE_EQ(static_cast<double>(i), ros_msg.r[i]);
   }
+}
+
+// ---------------------------------------------------------------------------
+// LaserScan GZ->Range ROS : gh issue #959. REP 117 reports +Inf when nothing
+// is detected within range and -Inf when a detection is too close to measure.
+// ---------------------------------------------------------------------------
+namespace
+{
+sensor_msgs::msg::Range ScanToRange(std::initializer_list<double> ranges)
+{
+  gz::msgs::LaserScan gz_msg;
+  gz_msg.set_range_min(0.1);
+  gz_msg.set_range_max(2.0);
+  for (const double range : ranges) {
+    gz_msg.add_ranges(range);
+  }
+  sensor_msgs::msg::Range ros_msg;
+  ros_gz_bridge::convert_gz_to_ros(gz_msg, ros_msg);
+  return ros_msg;
+}
+
+constexpr double kInfinity = std::numeric_limits<double>::infinity();
+}  // namespace
+
+TEST(LaserScanGzToRange, NoDetectionIsPositiveInfinity)
+{
+  const auto ros_msg = ScanToRange({kInfinity, kInfinity, kInfinity});
+  EXPECT_TRUE(std::isinf(ros_msg.range));
+  EXPECT_GT(ros_msg.range, 0.0f);
+}
+
+TEST(LaserScanGzToRange, EmptyScanIsPositiveInfinity)
+{
+  const auto ros_msg = ScanToRange({});
+  EXPECT_TRUE(std::isinf(ros_msg.range));
+  EXPECT_GT(ros_msg.range, 0.0f);
+}
+
+TEST(LaserScanGzToRange, ClosestDetectionWins)
+{
+  EXPECT_FLOAT_EQ(1.5f, ScanToRange({kInfinity, 1.5, 1.8}).range);
+}
+
+TEST(LaserScanGzToRange, TooCloseIsNegativeInfinity)
+{
+  const auto ros_msg = ScanToRange({-kInfinity, 1.0});
+  EXPECT_TRUE(std::isinf(ros_msg.range));
+  EXPECT_LT(ros_msg.range, 0.0f);
+}
+
+TEST(LaserScanGzToRange, FiniteBeyondMaxRangeIsPositiveInfinity)
+{
+  const auto ros_msg = ScanToRange({2.01, 5.0});
+  EXPECT_TRUE(std::isinf(ros_msg.range));
+  EXPECT_GT(ros_msg.range, 0.0f);
+}
+
+TEST(LaserScanGzToRange, FiniteBelowMinRangeIsNegativeInfinity)
+{
+  const auto ros_msg = ScanToRange({0.05, 1.0});
+  EXPECT_TRUE(std::isinf(ros_msg.range));
+  EXPECT_LT(ros_msg.range, 0.0f);
+}
+
+TEST(LaserScanGzToRange, BoundaryValuesAreKept)
+{
+  EXPECT_FLOAT_EQ(2.0f, ScanToRange({2.0}).range);
+  EXPECT_FLOAT_EQ(0.1f, ScanToRange({0.1, 1.0}).range);
 }
